@@ -5,7 +5,7 @@ use std::{
     num::NonZeroUsize,
     panic::UnwindSafe,
     sync::{
-        mpsc::{self, channel, Sender},
+        mpsc::{channel, Sender},
         Arc, Condvar, Mutex, MutexGuard,
     },
     thread::{self, available_parallelism, current},
@@ -151,10 +151,7 @@ impl ThreadPool {
         })
     }
 
-    pub fn send_job(
-        &self,
-        job: impl FnOnce() + Send + UnwindSafe + 'static,
-    ) -> Result<(), mpsc::SendError<ThreadPoolFunctionBoxed>> {
+    pub fn send_job(&self, job: impl FnOnce() + Send + UnwindSafe + 'static) {
         // NOTE: It is essential that the shared state is updated FIRST otherwise
         // we have a race condidition that the job is transmitted and read before
         // the shared state is updated, leading to a negative amount of jobs queued
@@ -170,7 +167,9 @@ impl ThreadPool {
         let cvar = self.cvar.clone();
         let job_with_state = Self::job_function(Box::new(job), state, cvar);
 
-        self.job_sender.send(Box::new(job_with_state))
+        self.job_sender
+            .send(Box::new(job_with_state))
+            .expect("The sender cannot be deallocated while the threadpool is in use")
     }
 
     pub fn wait_until_finished(&self) -> Result<(), JobHasPanicedError> {
@@ -381,7 +380,7 @@ mod test {
         let pool = builder.build().unwrap();
 
         for _ in 0..10 {
-            pool.send_job(panic_fn).unwrap();
+            pool.send_job(panic_fn);
         }
 
         assert!(
@@ -419,7 +418,7 @@ mod test {
 
         let pool = ThreadPoolBuilder::default().build().unwrap();
 
-        pool.send_job(func).unwrap();
+        pool.send_job(func);
 
         assert_eq!(rx.recv(), Ok(69), "Incorrect value received");
     }
@@ -443,8 +442,7 @@ mod test {
                     b0.wait();
                     b1.wait();
                 }
-            })
-            .unwrap();
+            });
         }
 
         b0.wait();
@@ -504,8 +502,7 @@ mod test {
                     b1.wait();
                 }
                 panic!("Test panic");
-            })
-            .unwrap();
+            });
         }
 
         b0.wait();
@@ -547,21 +544,18 @@ mod test {
                     b0_copy.wait();
                     b1_copy.wait();
                 }
-            })
-            .unwrap();
+            });
 
             let b0_copy = b0.clone();
             let b1_copy = b1.clone();
 
-            clone_with_new_state
-                .send_job(move || {
-                    if i < THREADS / 2 {
-                        b0_copy.wait();
-                        b1_copy.wait();
-                    }
-                    panic!("Test panic")
-                })
-                .unwrap();
+            clone_with_new_state.send_job(move || {
+                if i < THREADS / 2 {
+                    b0_copy.wait();
+                    b1_copy.wait();
+                }
+                panic!("Test panic")
+            });
         }
 
         b0.wait();
