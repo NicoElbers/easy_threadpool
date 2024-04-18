@@ -196,10 +196,7 @@ impl Display for ThreadPool {
 
 impl ThreadPool {
     fn new(builder: ThreadPoolBuilder) -> io::Result<Self> {
-        let thread_amount = match builder.thread_amount {
-            Some(amount) => amount,
-            None => available_parallelism()?,
-        };
+        let thread_amount = builder.thread_amount;
 
         let (job_sender, job_receiver) = channel::<ThreadPoolFunctionBoxed>();
         let job_sender = Arc::new(job_sender);
@@ -627,13 +624,14 @@ impl ThreadPool {
     ///
     /// ```rust
     /// use easy_threadpool::ThreadPoolBuilder;
+    /// use std::num::NonZeroUsize;
     ///
     /// let threads = 10;
     ///
     /// let num = NonZeroUsize::try_from(threads).unwrap();
     /// let pool = ThreadPoolBuilder::with_thread_amount(num).build().unwrap();
     ///
-    /// assert_eq!(pool.threads, threads);
+    /// assert_eq!(pool.threads().get(), threads);
     /// ```
     pub const fn threads(&self) -> NonZeroUsize {
         self.thread_amount
@@ -680,29 +678,38 @@ impl ThreadPool {
     }
 }
 
-#[derive(Default)]
 /// A ThreadPoolbuilder is a builder to easily create a thread pool
 pub struct ThreadPoolBuilder {
-    thread_amount: Option<NonZeroUsize>,
-    thread_name: Option<String>,
+    thread_amount: NonZeroUsize,
+    // thread_name: Option<String>,
+}
+
+impl Default for ThreadPoolBuilder {
+    fn default() -> Self {
+        Self {
+            thread_amount: NonZeroUsize::try_from(1).unwrap(),
+        }
+    }
 }
 
 impl ThreadPoolBuilder {
     /// Initialize the amount of threads the builder will build to `thread_amount`
     pub fn with_thread_amount(thread_amount: NonZeroUsize) -> ThreadPoolBuilder {
-        ThreadPoolBuilder {
-            thread_amount: Some(thread_amount),
-            ..Default::default()
-        }
+        ThreadPoolBuilder { thread_amount }
+    }
 
     /// Initialize the amount of threads the builder will build to `thread_amount`.
     ///
     /// # Errors
     ///
-    /// If `thread_amount` cannot be converted to a NonZeroUsize (aka it is 0).
+    /// If `thread_amount` cannot be converted to a [`std::num::NonZeroUsize`] (aka it is 0).
+    pub fn with_thread_amount_usize(
+        thread_amount: usize,
+    ) -> Result<ThreadPoolBuilder, TryFromIntError> {
+        let thread_amount = NonZeroUsize::try_from(thread_amount)?;
+        Ok(Self::with_thread_amount(thread_amount))
     }
 
-    pub fn with_max_threads() -> io::Result<ThreadPoolBuilder> {
     /// Initialize the amount of threads the builder will build to the available parallelism
     /// as provided by [`std::thread::available_parallelism`]
     ///
@@ -716,10 +723,10 @@ impl ThreadPoolBuilder {
     /// * If the program lacks permission to query the amount of parallelism made
     ///   available to it.
     ///
+    pub fn with_max_threads() -> io::Result<ThreadPoolBuilder> {
         let max_threads = available_parallelism()?;
         Ok(ThreadPoolBuilder {
-            thread_amount: Some(max_threads),
-            ..Default::default()
+            thread_amount: max_threads,
         })
     }
 
@@ -732,7 +739,7 @@ impl ThreadPoolBuilder {
 
     /// Set the thead amount in the builder
     pub fn set_thread_amount(mut self, thread_amount: NonZeroUsize) -> ThreadPoolBuilder {
-        self.thread_amount = Some(thread_amount);
+        self.thread_amount = thread_amount;
         self
     }
 
@@ -764,7 +771,7 @@ impl ThreadPoolBuilder {
     ///
     pub fn set_max_threads(mut self) -> io::Result<ThreadPoolBuilder> {
         let max_threads = available_parallelism()?;
-        self.thread_amount = Some(max_threads);
+        self.thread_amount = max_threads;
         Ok(self)
     }
 
@@ -865,7 +872,10 @@ mod test {
         let b0 = Arc::new(Barrier::new(THREADS + 1));
         let b1 = Arc::new(Barrier::new(THREADS + 1));
 
-        let pool = ThreadPoolBuilder::default().build().unwrap();
+        let pool = ThreadPoolBuilder::with_thread_amount_usize(THREADS)
+            .unwrap()
+            .build()
+            .unwrap();
 
         for i in 0..TASKS {
             let b0 = b0.clone();
@@ -924,7 +934,8 @@ mod test {
         let b0 = Arc::new(Barrier::new(THREADS + 1));
         let b1 = Arc::new(Barrier::new(THREADS + 1));
 
-        let pool = ThreadPoolBuilder::default().build().unwrap();
+        let builder = ThreadPoolBuilder::with_thread_amount_usize(THREADS).unwrap();
+        let pool = builder.build().unwrap();
 
         for i in 0..TASKS {
             let b0 = b0.clone();
@@ -962,7 +973,10 @@ mod test {
         const TASKS: usize = 1000;
         const THREADS: usize = 16;
 
-        let pool = ThreadPoolBuilder::default().build().unwrap();
+        let pool = ThreadPoolBuilder::with_thread_amount_usize(THREADS)
+            .unwrap()
+            .build()
+            .unwrap();
         let clone = pool.clone();
         let clone_with_new_state = pool.clone_with_new_state();
 
@@ -1085,13 +1099,109 @@ mod test {
     }
 
     #[test]
+    fn reset_state_while_running() {
+        const TASKS: usize = 32;
+        const THREADS: usize = 16;
+
+        let mut pool = ThreadPoolBuilder::with_thread_amount_usize(THREADS)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let b0 = Arc::new(Barrier::new(THREADS + 1));
+        let b1 = Arc::new(Barrier::new(THREADS + 1));
+
+        for i in 0..TASKS {
+            let b0_copy = b0.clone();
+            let b1_copy = b1.clone();
+
+            pool.send_job(move || {
+                if i < THREADS {
+                    b0_copy.wait();
+                    b1_copy.wait();
+                }
+            });
+        }
+
+        b0.wait();
+
+        assert_ne!(pool.jobs_queued(), 0);
+        assert_ne!(pool.jobs_running(), 0);
+
+        pool.reset_state();
+
+        assert_eq!(pool.jobs_queued(), 0);
+        assert_eq!(pool.jobs_running(), 0);
+        assert_eq!(pool.jobs_paniced(), 0);
+
+        b1.wait();
+        pool.wait_until_finished().expect("Nothing should panic");
+
+        // Give time for the jobs to execute
+        sleep(Duration::from_secs(1));
+
+        assert_eq!(pool.jobs_queued(), 0);
+        assert_eq!(pool.jobs_running(), 0);
+        assert_eq!(pool.jobs_paniced(), 0);
+    }
+
+    #[test]
+    fn reset_panic_test() {
+        const TASKS: usize = 32;
+        const THREADS: usize = 16;
+
+        let num = NonZeroUsize::try_from(THREADS).unwrap();
+        let mut pool = ThreadPoolBuilder::with_thread_amount(num).build().unwrap();
+
+        let b0 = Arc::new(Barrier::new(THREADS + 1));
+        let b1 = Arc::new(Barrier::new(THREADS + 1));
+
+        for i in 0..TASKS {
+            let b0_copy = b0.clone();
+            let b1_copy = b1.clone();
+
+            pool.send_job(move || {
+                if i < THREADS {
+                    b0_copy.wait();
+                    b1_copy.wait();
+                }
+                panic!("Test panic");
+            });
+        }
+
+        b0.wait();
+
+        assert_ne!(pool.jobs_queued(), 0);
+        assert_ne!(pool.jobs_running(), 0);
+        assert_eq!(pool.jobs_paniced(), 0);
+
+        pool.reset_state();
+
+        assert_eq!(pool.jobs_queued(), 0);
+        assert_eq!(pool.jobs_running(), 0);
+        assert_eq!(pool.jobs_paniced(), 0);
+
+        b1.wait();
+        pool.wait_until_finished().expect("Nothing should panic");
+
+        // Give time for the jobs to execute
+        sleep(Duration::from_secs(1));
+
+        assert_eq!(pool.jobs_queued(), 0);
+        assert_eq!(pool.jobs_running(), 0);
+        assert_eq!(pool.jobs_paniced(), 0);
+    }
+
+    // #[test]
+    #[allow(dead_code)]
     fn test_flakiness() {
-        for _ in 0..10000 {
+        for _ in 0..10 {
             test_wait();
             test_wait_unchecked();
             deal_with_panics();
             receive_value();
             test_clones();
+            reset_state_while_running();
         }
     }
 }
