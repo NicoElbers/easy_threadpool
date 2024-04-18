@@ -8,7 +8,8 @@ description = "A relatively simple thread pool which you can send jobs to"
 
 keywords = ["threadpool", "simple"]
 
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[package.metadata.docs.rs]
+all-features = true
 
 [dependencies]
+
