@@ -1,8 +1,96 @@
+#![forbid(missing_docs)]
+//! A simple thread pool to execute jobs in parallel
+//!
+//! A simple crate without dependencies which allows you to create a threadpool
+//! that has a specified amount of threads which execute given jobs. Threads don't
+//! crash when a job panics!
+//!
+//! # Examples
+//!
+//! ## Basic usage
+//!
+//! A basic use of the threadpool
+//!
+//! ```rust
+//! use easy_threadpool::ThreadPoolBuilder;
+//!
+//! fn job() {
+//!     println!("Hello world!");
+//! }
+//!
+//! let builder = ThreadPoolBuilder::with_max_threads().unwrap();
+//! let pool = builder.build().unwrap();
+//!
+//! for _ in 0..10 {
+//!     pool.send_job(job);
+//! }
+//!
+//! assert!(pool.wait_until_finished().is_ok());
+//! ```
+//!
+//! ## More advanced usage
+//!
+//! A slightly more advanced usage of the threadpool
+//!
+//! ```rust
+//! use easy_threadpool::ThreadPoolBuilder;
+//! use std::sync::mpsc::channel;
+//!
+//! let builder = ThreadPoolBuilder::with_max_threads().unwrap();
+//! let pool = builder.build().unwrap();
+//!
+//! let (tx, rx) = channel();
+//!
+//! for _ in 0..10 {
+//!     let tx = tx.clone();
+//!     pool.send_job(move || {
+//!         tx.send(1).unwrap();
+//!     });
+//! }
+//!
+//! assert!(pool.wait_until_finished().is_ok());
+//!
+//! assert_eq!(rx.iter().take(10).fold(0, |a, b| a + b), 10);
+//! ```
+//!
+//! ## Dealing with panics
+//!
+//! This threadpool implementation is resistant to jobs panicing
+//!
+//! ```rust
+//! use easy_threadpool::ThreadPoolBuilder;
+//! use std::sync::mpsc::channel;
+//! use std::num::NonZeroUsize;
+//!
+//! fn panic_fn() {
+//!     panic!("Test panic");
+//! }
+//!
+//! let num = NonZeroUsize::try_from(1).unwrap();
+//! let builder = ThreadPoolBuilder::with_thread_amount(num);
+//! let pool = builder.build().unwrap();
+//!
+//! let (tx, rx) = channel();
+//! for _ in 0..10 {
+//!     let tx = tx.clone();
+//!     pool.send_job(move || {
+//!         tx.send(1).unwrap();
+//!         panic!("Test panic");
+//!     });
+//! }
+//!
+//! assert!(pool.wait_until_finished().is_err());
+//! pool.wait_until_finished_unchecked();
+//!
+//! assert_eq!(pool.jobs_paniced(), 10);
+//! assert_eq!(rx.iter().take(10).fold(0, |a, b| a + b), 10);
+//! ```
+
 use std::{
     error::Error,
     fmt::Display,
     io,
-    num::NonZeroUsize,
+    num::{NonZeroUsize, TryFromIntError},
     panic::UnwindSafe,
     sync::{
         mpsc::{channel, Sender},
@@ -13,6 +101,7 @@ use std::{
 
 type ThreadPoolFunctionBoxed = Box<dyn FnOnce() + Send + UnwindSafe>;
 
+/// Simple error to indicate that a job has paniced in the threadpool
 #[derive(Debug)]
 pub struct JobHasPanicedError {}
 
@@ -71,6 +160,7 @@ impl SharedState {
     }
 }
 
+/// Threadpool abstraction to keep some state
 pub struct ThreadPool {
     thread_amount: NonZeroUsize,
     job_sender: Arc<Sender<ThreadPoolFunctionBoxed>>,
@@ -151,6 +241,32 @@ impl ThreadPool {
         })
     }
 
+    /// The `send_job` function takes in a function or closure without any arguments
+    /// and sends it to the threadpool to be executed. Jobs will be taken from the
+    /// job queue in order of them being sent, but that in no way guarantees they will
+    /// be executed in order.
+    ///
+    /// `job`s must implement `Send` in order to be safely sent across threads and
+    /// `UnwindSafe` to allow catching panics when executing the jobs. Both of these
+    /// traits are auto implemented.
+    ///
+    /// # Examples
+    ///
+    /// Sending a function or closure to the threadpool
+    /// ```rust
+    /// use easy_threadpool::ThreadPoolBuilder;
+    ///
+    /// fn job() {
+    ///     println!("Hello world from a function!");
+    /// }
+    ///
+    /// let builder = ThreadPoolBuilder::with_max_threads().unwrap();
+    /// let pool = builder.build().unwrap();
+    ///
+    /// pool.send_job(job);
+    ///
+    /// pool.send_job(|| println!("Hello world from a closure!"));
+    /// ```
     pub fn send_job(&self, job: impl FnOnce() + Send + UnwindSafe + 'static) {
         // NOTE: It is essential that the shared state is updated FIRST otherwise
         // we have a race condidition that the job is transmitted and read before
@@ -172,6 +288,39 @@ impl ThreadPool {
             .expect("The sender cannot be deallocated while the threadpool is in use")
     }
 
+    /// This function will wait until all jobs have finished sending. Additionally
+    /// it will return early if any job panics.
+    ///
+    /// Be careful though, returning early DOES NOT mean that the sent jobs are
+    /// cancelled. They will remain running. Cancelling jobs that are queued is not
+    /// a feature provided by this crate as of now.
+    ///
+    /// # Errors
+    ///
+    /// This function will error if any job sent to the threadpool has errored.
+    /// This includes any errors since either the threadpool was created or since
+    /// the state was reset.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use easy_threadpool::ThreadPoolBuilder;
+    ///
+    /// let builder = ThreadPoolBuilder::with_max_threads().unwrap();
+    /// let pool = builder.build().unwrap();
+    ///
+    /// for _ in 0..10 {
+    ///     pool.send_job(|| println!("Hello world"));
+    /// }
+    ///
+    /// assert!(pool.wait_until_finished().is_ok());
+    /// assert!(pool.is_finished());
+    ///
+    /// pool.send_job(|| panic!("Test panic"));
+    ///
+    /// assert!(pool.wait_until_finished().is_err());
+    /// assert!(pool.has_paniced());
+    /// ```
     pub fn wait_until_finished(&self) -> Result<(), JobHasPanicedError> {
         fn finished(guard: &MutexGuard<SharedState>) -> bool {
             guard.jobs_running == 0 && guard.jobs_queued == 0
@@ -192,7 +341,7 @@ impl ThreadPool {
                 .expect("Threadpool shared state has paniced");
         }
 
-        // Keep the guard to not have to relock later
+        // Keep the guard so we don't have to drop the lock only to reaquire it
         if paniced(&guard) {
             Err(JobHasPanicedError {})
         } else {
@@ -200,6 +349,33 @@ impl ThreadPool {
         }
     }
 
+    /// This function will wait until all jobs have finished sending. It will continue
+    /// waiting if a job panics in the thread pool.
+    ///
+    /// I highly doubt this has much of a performance improvement, but it's very
+    /// useful if you know that for whatever reason your jobs might panic and that
+    /// would be fine.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use easy_threadpool::ThreadPoolBuilder;
+    ///
+    /// let builder = ThreadPoolBuilder::with_max_threads().unwrap();
+    /// let pool = builder.build().unwrap();
+    ///
+    /// for _ in 0..10 {
+    ///     pool.send_job(|| println!("Hello world"));
+    /// }
+    ///
+    /// pool.wait_until_finished_unchecked();
+    /// assert!(pool.is_finished());
+    ///
+    /// pool.send_job(|| panic!("Test panic"));
+    ///
+    /// pool.wait_until_finished_unchecked();
+    /// assert!(pool.has_paniced());
+    /// ```
     pub fn wait_until_finished_unchecked(&self) {
         fn finished(guard: &MutexGuard<SharedState>) -> bool {
             guard.jobs_running == 0 && guard.jobs_queued == 0
@@ -210,6 +386,7 @@ impl ThreadPool {
             .lock()
             .expect("Threadpool shared state has paniced");
 
+        // Keep the guard so we don't have to drop the lock only to reaquire it
         while !finished(&guard) {
             guard = self
                 .cvar
@@ -218,6 +395,31 @@ impl ThreadPool {
         }
     }
 
+    /// This function will reset the state of this instance of the threadpool.
+    ///
+    /// When resetting the state you lose all information about previously sent jobs.
+    /// If a job you previously sent panics, you will not be notified, nor can  you
+    /// wait until your previously sent jobs are done running. HOWEVER they will still
+    /// be running. Be very careful to not see this as a "stop" button.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use easy_threadpool::ThreadPoolBuilder;
+    ///
+    /// let builder = ThreadPoolBuilder::with_max_threads().unwrap();
+    /// let mut pool = builder.build().unwrap();
+    ///
+    /// pool.send_job(|| panic!("Test panic"));
+    ///
+    /// assert!(pool.wait_until_finished().is_err());
+    /// assert!(pool.has_paniced());
+    ///
+    /// pool.reset_state();
+    ///
+    /// assert!(pool.wait_until_finished().is_ok());
+    /// assert!(!pool.has_paniced());
+    /// ```
     pub fn reset_state(&mut self) {
         let cvar = Arc::new(Condvar::new());
         let shared_state = SharedState::new();
@@ -226,12 +428,76 @@ impl ThreadPool {
         self.shared_state = shared_state;
     }
 
+    /// This function will clone the threadpool and then reset its state. This
+    /// makes it so you can have 2 different states operate on the same threads,
+    /// effectively sharing the threads.
+    ///
+    /// Note however that there is no mechanism
+    /// to give different instances equal CPU time, jobs are executed on a first
+    /// come first server basis.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use easy_threadpool::ThreadPoolBuilder;
+    ///
+    /// let builder = ThreadPoolBuilder::with_max_threads().unwrap();
+    /// let pool = builder.build().unwrap();
+    ///
+    /// let pool_clone = pool.clone_with_new_state();
+    ///
+    /// pool.send_job(|| panic!("Test panic"));
+    ///
+    /// assert!(pool.wait_until_finished().is_err());
+    /// assert!(pool.has_paniced());
+    ///
+    /// assert!(pool_clone.wait_until_finished().is_ok());
+    /// assert!(!pool_clone.has_paniced());
+    /// ```
     pub fn clone_with_new_state(&self) -> Self {
         let mut new_pool = self.clone();
         new_pool.reset_state();
         new_pool
     }
 
+    /// Returns the amount of jobs currently being ran by this instance of the
+    /// thread pool. If muliple different instances of this threadpool (see [`clone_with_new_state`])
+    /// this number might be lower than the max amount of threads, even if there
+    /// are still jobs queued
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use easy_threadpool::ThreadPoolBuilder;
+    /// use std::{
+    ///     num::NonZeroUsize,
+    ///     sync::{Arc, Barrier},
+    /// };
+    /// let threads = 16;
+    /// let tasks = threads * 10;
+    ///
+    /// let num = NonZeroUsize::try_from(threads).unwrap();
+    /// let pool = ThreadPoolBuilder::with_thread_amount(num).build().unwrap();
+    ///
+    /// let b0 = Arc::new(Barrier::new(threads + 1));
+    /// let b1 = Arc::new(Barrier::new(threads + 1));
+    ///
+    /// for i in 0..tasks {
+    ///     let b0_copy = b0.clone();
+    ///     let b1_copy = b1.clone();
+    ///
+    ///     pool.send_job(move || {
+    ///         if i < threads {
+    ///             b0_copy.wait();
+    ///             b1_copy.wait();
+    ///         }
+    ///     });
+    /// }
+    ///
+    /// b0.wait();
+    /// assert_eq!(pool.jobs_running(), threads);
+    /// b1.wait();
+    /// ```
     pub fn jobs_running(&self) -> usize {
         self.shared_state
             .lock()
@@ -239,6 +505,43 @@ impl ThreadPool {
             .jobs_running
     }
 
+    /// Returns the amount of jobs currently queued by this threadpool instance.
+    /// There might be more jobs queued that we don't know about if there are other
+    /// instances of this threadpool (see [`clone_with_new_state`]).
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use easy_threadpool::ThreadPoolBuilder;
+    /// use std::{
+    ///     num::NonZeroUsize,
+    ///     sync::{Arc, Barrier},
+    /// };
+    /// let threads = 16;
+    /// let tasks = 100;
+    ///
+    /// let num = NonZeroUsize::try_from(threads).unwrap();
+    /// let pool = ThreadPoolBuilder::with_thread_amount(num).build().unwrap();
+    ///
+    /// let b0 = Arc::new(Barrier::new(threads + 1));
+    /// let b1 = Arc::new(Barrier::new(threads + 1));
+    ///
+    /// for i in 0..tasks {
+    ///     let b0_copy = b0.clone();
+    ///     let b1_copy = b1.clone();
+    ///
+    ///     pool.send_job(move || {
+    ///         if i < threads {
+    ///             b0_copy.wait();
+    ///             b1_copy.wait();
+    ///         }
+    ///     });
+    /// }
+    ///
+    /// b0.wait();
+    /// assert_eq!(pool.jobs_queued(), tasks - threads);
+    /// b1.wait();
+    /// ```
     pub fn jobs_queued(&self) -> usize {
         self.shared_state
             .lock()
@@ -246,21 +549,92 @@ impl ThreadPool {
             .jobs_queued
     }
 
-    pub fn threads_paniced(&self) -> usize {
+    /// Returns the amount of jobs that were sent by this instance of the threadpool
+    /// and that paniced.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use easy_threadpool::ThreadPoolBuilder;
+    ///
+    /// let pool = ThreadPoolBuilder::with_max_threads().unwrap().build().unwrap();
+    ///
+    /// for i in 0..10 {
+    ///     pool.send_job(|| panic!("Test panic"));
+    /// }
+    ///
+    /// pool.wait_until_finished_unchecked();
+    ///
+    /// assert_eq!(pool.jobs_paniced(), 10);
+    /// ```
+    pub fn jobs_paniced(&self) -> usize {
         self.shared_state
             .lock()
             .expect("Threadpool shared state has paniced")
             .jobs_paniced
     }
 
+    /// Returns whether a thread has had any jobs panic at all
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use easy_threadpool::ThreadPoolBuilder;
+    ///
+    /// let pool = ThreadPoolBuilder::with_max_threads().unwrap().build().unwrap();
+    ///
+    /// pool.send_job(|| panic!("Test panic"));
+    ///
+    /// pool.wait_until_finished_unchecked();
+    ///
+    /// assert!(pool.has_paniced());
+    /// ```
     pub fn has_paniced(&self) -> bool {
-        self.threads_paniced() != 0
+        self.jobs_paniced() != 0
     }
 
+    /// Returns whether a threadpool instance has no jobs running and no jobs queued,
+    /// in other words if it's finished.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use easy_threadpool::ThreadPoolBuilder;
+    /// use std::{
+    ///     num::NonZeroUsize,
+    ///     sync::{Arc, Barrier},
+    /// };
+    /// let pool = ThreadPoolBuilder::with_max_threads().unwrap().build().unwrap();
+    ///
+    /// let b = Arc::new(Barrier::new(2));
+    ///
+    /// assert!(pool.is_finished());
+    ///
+    /// let b_clone = b.clone();
+    /// pool.send_job(move || { b_clone.wait(); });
+    ///
+    /// assert!(!pool.is_finished());
+    ///
+    /// b.wait();
+    /// ```
     pub fn is_finished(&self) -> bool {
         self.jobs_running() == 0 && self.jobs_queued() == 0
     }
 
+    /// This function returns the amount of threads used to create the threadpool
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use easy_threadpool::ThreadPoolBuilder;
+    ///
+    /// let threads = 10;
+    ///
+    /// let num = NonZeroUsize::try_from(threads).unwrap();
+    /// let pool = ThreadPoolBuilder::with_thread_amount(num).build().unwrap();
+    ///
+    /// assert_eq!(pool.threads, threads);
+    /// ```
     pub const fn threads(&self) -> NonZeroUsize {
         self.thread_amount
     }
@@ -307,20 +681,41 @@ impl ThreadPool {
 }
 
 #[derive(Default)]
+/// A ThreadPoolbuilder is a builder to easily create a thread pool
 pub struct ThreadPoolBuilder {
     thread_amount: Option<NonZeroUsize>,
     thread_name: Option<String>,
 }
 
 impl ThreadPoolBuilder {
+    /// Initialize the amount of threads the builder will build to `thread_amount`
     pub fn with_thread_amount(thread_amount: NonZeroUsize) -> ThreadPoolBuilder {
         ThreadPoolBuilder {
             thread_amount: Some(thread_amount),
             ..Default::default()
         }
+
+    /// Initialize the amount of threads the builder will build to `thread_amount`.
+    ///
+    /// # Errors
+    ///
+    /// If `thread_amount` cannot be converted to a NonZeroUsize (aka it is 0).
     }
 
     pub fn with_max_threads() -> io::Result<ThreadPoolBuilder> {
+    /// Initialize the amount of threads the builder will build to the available parallelism
+    /// as provided by [`std::thread::available_parallelism`]
+    ///
+    /// # Errors
+    ///
+    /// Taken from the available_parallelism() documentation:
+    /// This function will, but is not limited to, return errors in the following
+    /// cases:
+    ///
+    /// * If the amount of parallelism is not known for the target platform.
+    /// * If the program lacks permission to query the amount of parallelism made
+    ///   available to it.
+    ///
         let max_threads = available_parallelism()?;
         Ok(ThreadPoolBuilder {
             thread_amount: Some(max_threads),
@@ -328,29 +723,66 @@ impl ThreadPoolBuilder {
         })
     }
 
-    pub fn with_thread_name(thread_name: String) -> ThreadPoolBuilder {
-        ThreadPoolBuilder {
-            thread_name: Some(thread_name),
-            ..Default::default()
-        }
-    }
+    // pub fn with_thread_name(thread_name: String) -> ThreadPoolBuilder {
+    //     ThreadPoolBuilder {
+    //         thread_name: Some(thread_name),
+    //         ..Default::default()
+    //     }
+    // }
 
+    /// Set the thead amount in the builder
     pub fn set_thread_amount(mut self, thread_amount: NonZeroUsize) -> ThreadPoolBuilder {
         self.thread_amount = Some(thread_amount);
         self
     }
 
+    /// Set the thead amount in the builder from usize
+    ///
+    /// # Errors
+    ///
+    /// If `thread_amount` cannot be turned into NonZeroUsize (aka it is 0)
+    pub fn set_thread_amount_usize(
+        self,
+        thread_amount: usize,
+    ) -> Result<ThreadPoolBuilder, TryFromIntError> {
+        let thread_amount = NonZeroUsize::try_from(thread_amount)?;
+        Ok(self.set_thread_amount(thread_amount))
+    }
+
+    /// set the amount of threads the builder will build to the available parallelism
+    /// as provided by [`std::thread::available_parallelism`]
+    ///
+    /// # Errors
+    ///
+    /// Taken from the available_parallelism() documentation:
+    /// This function will, but is not limited to, return errors in the following
+    /// cases:
+    ///
+    /// * If the amount of parallelism is not known for the target platform.
+    /// * If the program lacks permission to query the amount of parallelism made
+    ///   available to it.
+    ///
     pub fn set_max_threads(mut self) -> io::Result<ThreadPoolBuilder> {
         let max_threads = available_parallelism()?;
         self.thread_amount = Some(max_threads);
         Ok(self)
     }
 
-    pub fn set_thread_name(mut self, thread_name: String) -> ThreadPoolBuilder {
-        self.thread_name = Some(thread_name);
-        self
-    }
+    // pub fn set_thread_name(mut self, thread_name: String) -> ThreadPoolBuilder {
+    //     self.thread_name = Some(thread_name);
+    //     self
+    // }
 
+    /// Build the builder into a threadpool, taking all the initialized values
+    /// from the builder and using defaults for those not initialized.
+    ///
+    /// # Errors
+    ///
+    /// Taken from [`std::thread::Builder::spawn`]:
+    ///
+    /// Unlike the [`spawn`](https://doc.rust-lang.org/stable/std/thread/fn.spawn.html) free function, this method yields an
+    /// [`io::Result`] to capture any failure to create the thread at
+    /// the OS level.
     pub fn build(self) -> io::Result<ThreadPool> {
         ThreadPool::new(self)
     }
@@ -362,6 +794,8 @@ mod test {
     use std::{
         num::NonZeroUsize,
         sync::{mpsc::channel, Arc, Barrier},
+        thread::sleep,
+        time::Duration,
     };
 
     use crate::ThreadPoolBuilder;
@@ -403,7 +837,7 @@ mod test {
             "Incorrect amount of jobs running after wait"
         );
         assert!(
-            pool.threads_paniced() == 10,
+            pool.jobs_paniced() == 10,
             "Incorrect amount of jobs paniced after wait"
         );
     }
@@ -453,7 +887,7 @@ mod test {
             "Incorrect amount of jobs running"
         );
         assert_eq!(
-            pool.threads_paniced(),
+            pool.jobs_paniced(),
             0,
             "Incorrect amount of threads paniced"
         );
@@ -476,7 +910,7 @@ mod test {
             "Incorrect amount of jobs running after wait"
         );
         assert_eq!(
-            pool.threads_paniced(),
+            pool.jobs_paniced(),
             0,
             "Incorrect amount of threads paniced after wait"
         );
@@ -512,7 +946,7 @@ mod test {
             THREADS,
             "Incorrect amount of jobs running"
         );
-        assert_eq!(pool.threads_paniced(), 0);
+        assert_eq!(pool.jobs_paniced(), 0);
 
         b1.wait();
 
@@ -520,7 +954,7 @@ mod test {
 
         assert_eq!(pool.jobs_queued(), 0);
         assert_eq!(pool.jobs_running(), 0);
-        assert_eq!(pool.threads_paniced(), TASKS);
+        assert_eq!(pool.jobs_paniced(), TASKS);
     }
 
     #[test]
@@ -567,7 +1001,7 @@ mod test {
             "Incorrect amount of jobs running in pool"
         );
         assert_eq!(
-            pool.threads_paniced(),
+            pool.jobs_paniced(),
             0,
             "Incorrect amount of jobs paniced in pool"
         );
@@ -579,7 +1013,7 @@ mod test {
             "Incorrect amount of jobs running in clone_with_new_state"
         );
         assert_eq!(
-            clone_with_new_state.threads_paniced(),
+            clone_with_new_state.jobs_paniced(),
             0,
             "Incorrect amount of jobs paniced in clone_with_new_state"
         );
@@ -606,7 +1040,7 @@ mod test {
             "Incorrect amount of jobs running in pool after wait"
         );
         assert_eq!(
-            pool.threads_paniced(),
+            pool.jobs_paniced(),
             0,
             "Incorrect amount of jobs paniced in pool after wait"
         );
@@ -628,7 +1062,7 @@ mod test {
             "Incorrect amount of jobs running in clone_with_new_state after wait"
         );
         assert_eq!(
-            clone_with_new_state.threads_paniced(),
+            clone_with_new_state.jobs_paniced(),
             TASKS,
             "Incorrect panics in clone"
         );
@@ -644,7 +1078,7 @@ mod test {
             "Incorrect amount of jobs running in pool after everything"
         );
         assert_eq!(
-            pool.threads_paniced(),
+            pool.jobs_paniced(),
             0,
             "Incorrect amount of jobs paniced in pool after everything"
         );
