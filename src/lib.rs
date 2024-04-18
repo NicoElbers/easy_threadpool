@@ -152,8 +152,8 @@ impl ThreadPool {
     }
 
     pub fn send_job(
-        &mut self,
-        job: impl FnOnce() + Send + Sync + UnwindSafe + 'static,
+        &self,
+        job: impl FnOnce() + Send + UnwindSafe + 'static,
     ) -> Result<(), mpsc::SendError<ThreadPoolFunctionBoxed>> {
         // NOTE: It is essential that the shared state is updated FIRST otherwise
         // we have a race condidition that the job is transmitted and read before
@@ -378,7 +378,7 @@ mod test {
         let thread_num: NonZeroUsize = 1.try_into().unwrap();
         let builder = ThreadPoolBuilder::with_thread_amount(thread_num);
 
-        let mut pool = builder.build().unwrap();
+        let pool = builder.build().unwrap();
 
         for _ in 0..10 {
             pool.send_job(panic_fn).unwrap();
@@ -417,7 +417,7 @@ mod test {
             tx.send(69).unwrap();
         };
 
-        let mut pool = ThreadPoolBuilder::default().build().unwrap();
+        let pool = ThreadPoolBuilder::default().build().unwrap();
 
         pool.send_job(func).unwrap();
 
@@ -432,7 +432,7 @@ mod test {
         let b0 = Arc::new(Barrier::new(THREADS + 1));
         let b1 = Arc::new(Barrier::new(THREADS + 1));
 
-        let mut pool = ThreadPoolBuilder::default().build().unwrap();
+        let pool = ThreadPoolBuilder::default().build().unwrap();
 
         for i in 0..TASKS {
             let b0 = b0.clone();
@@ -492,7 +492,7 @@ mod test {
         let b0 = Arc::new(Barrier::new(THREADS + 1));
         let b1 = Arc::new(Barrier::new(THREADS + 1));
 
-        let mut pool = ThreadPoolBuilder::default().build().unwrap();
+        let pool = ThreadPoolBuilder::default().build().unwrap();
 
         for i in 0..TASKS {
             let b0 = b0.clone();
@@ -531,9 +531,9 @@ mod test {
         const TASKS: usize = 1000;
         const THREADS: usize = 16;
 
-        let mut pool = ThreadPoolBuilder::default().build().unwrap();
+        let pool = ThreadPoolBuilder::default().build().unwrap();
         let clone = pool.clone();
-        let mut clone_with_new_state = pool.clone_with_new_state();
+        let clone_with_new_state = pool.clone_with_new_state();
 
         let b0 = Arc::new(Barrier::new(THREADS + 1));
         let b1 = Arc::new(Barrier::new(THREADS + 1));
