@@ -285,6 +285,46 @@ impl ThreadPool {
             .expect("The sender cannot be deallocated while the threadpool is in use")
     }
 
+    fn job_function(
+        job: ThreadPoolFunctionBoxed,
+        state: Arc<Mutex<SharedState>>,
+        cvar: Arc<Condvar>,
+    ) -> impl FnOnce() + Send + 'static {
+        move || {
+            state
+                .lock()
+                .expect("Threadpool shared state has paniced")
+                .job_starting();
+
+            // NOTE: The use of catch_unwind means that the thread will not
+            // panic from any of the jobs it was sent. This is useful because
+            // we won't ever have to restart a thread.
+            let result = std::panic::catch_unwind(job);
+
+            // NOTE: Do the panic check first otherwise we have a race condition
+            // where the final job panics and the wait_until_finished function
+            // doesn't detect it
+            if result.is_err() {
+                state
+                    .lock()
+                    .expect("Threadpool shared state has paniced")
+                    .job_paniced();
+
+                eprintln!(
+                    "Job paniced: Thread \"{}\" is panicing",
+                    current().name().unwrap_or("Unnamed worker")
+                );
+            }
+
+            state
+                .lock()
+                .expect("Threadpool shared state has paniced")
+                .job_finished();
+
+            cvar.notify_all();
+        }
+    }
+
     /// This function will wait until all jobs have finished sending. Additionally
     /// it will return early if any job panics.
     ///
@@ -635,46 +675,6 @@ impl ThreadPool {
     /// ```
     pub const fn threads(&self) -> NonZeroUsize {
         self.thread_amount
-    }
-
-    fn job_function(
-        job: ThreadPoolFunctionBoxed,
-        state: Arc<Mutex<SharedState>>,
-        cvar: Arc<Condvar>,
-    ) -> impl FnOnce() + Send + 'static {
-        move || {
-            state
-                .lock()
-                .expect("Threadpool shared state has paniced")
-                .job_starting();
-
-            // NOTE: The use of catch_unwind means that the thread will not
-            // panic from any of the jobs it was sent. This is useful because
-            // we won't ever have to restart a thread.
-            let result = std::panic::catch_unwind(job);
-
-            // NOTE: Do the panic check first otherwise we have a race condition
-            // where the final job panics and the wait_until_finished function
-            // doesn't detect it
-            if result.is_err() {
-                state
-                    .lock()
-                    .expect("Threadpool shared state has paniced")
-                    .job_paniced();
-
-                eprintln!(
-                    "Job paniced: Thread \"{}\" is panicing",
-                    current().name().unwrap_or("Unnamed worker")
-                );
-            }
-
-            state
-                .lock()
-                .expect("Threadpool shared state has paniced")
-                .job_finished();
-
-            cvar.notify_all();
-        }
     }
 }
 
