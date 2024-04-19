@@ -5,6 +5,9 @@ authors = ["Nico Elbers"]
 edition = "2021"
 rust-version = "1.72.0"
 description = "A relatively simple thread pool which you can send jobs to"
+license = "MIT"
+repository = "https://github.com/NicoElbers/easy_threadpool"
+
 
 keywords = ["threadpool", "simple"]
 
