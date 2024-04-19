@@ -128,39 +128,39 @@ impl Display for JobHasPanicedError {
 
 impl Error for JobHasPanicedError {}
 
-/// Simple error to indicate a function passed to do_until_finished has paniced
-#[derive(Debug)]
-pub struct DoUntilFinishedFunctionPanicedError {}
+// /// Simple error to indicate a function passed to do_until_finished has paniced
+// #[derive(Debug)]
+// pub struct DoUntilFinishedFunctionPanicedError {}
 
-impl Display for DoUntilFinishedFunctionPanicedError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "The function passed to do_until_finished has paniced")
-    }
-}
+// impl Display for DoUntilFinishedFunctionPanicedError {
+//     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+//         write!(f, "The function passed to do_until_finished has paniced")
+//     }
+// }
 
-impl Error for DoUntilFinishedFunctionPanicedError {}
+// impl Error for DoUntilFinishedFunctionPanicedError {}
 
-/// An enum to combine both errors previously defined
-#[derive(Debug)]
-pub enum Errors {
-    /// Enum representation of [`JobHasPanicedError`]
-    JobHasPanicedError,
-    /// Enum representation of [`DoUntilFinishedFunctionPanicedError`]
-    DoUntilFinishedFunctionPanicedError,
-}
+// /// An enum to combine both errors previously defined
+// #[derive(Debug)]
+// pub enum Errors {
+//     /// Enum representation of [`JobHasPanicedError`]
+//     JobHasPanicedError,
+//     /// Enum representation of [`DoUntilFinishedFunctionPanicedError`]
+//     DoUntilFinishedFunctionPanicedError,
+// }
 
-impl Display for Errors {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Errors::DoUntilFinishedFunctionPanicedError => {
-                Display::fmt(&DoUntilFinishedFunctionPanicedError {}, f)
-            }
-            Errors::JobHasPanicedError => Display::fmt(&JobHasPanicedError {}, f),
-        }
-    }
-}
+// impl Display for Errors {
+//     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+//         match self {
+//             Errors::DoUntilFinishedFunctionPanicedError => {
+//                 Display::fmt(&DoUntilFinishedFunctionPanicedError {}, f)
+//             }
+//             Errors::JobHasPanicedError => Display::fmt(&JobHasPanicedError {}, f),
+//         }
+//     }
+// }
 
-impl Error for Errors {}
+// impl Error for Errors {}
 
 struct SharedState {
     jobs_queued: usize,
@@ -443,13 +443,9 @@ impl ThreadPool {
         }
     }
 
-    /// This function will wait until all jobs have finished sending. Additionally
-    /// it will return early if any job panics and every time a job is completed
-    /// a function is executed.
-    ///
-    /// The function passed to execute on job completion may panic and this panic
-    /// will be caught. It is important to note that if a job panics it will execute
-    /// the passed in function one more time.
+    /// This function will wait until one job finished after calling the function.
+    /// Additionally, if the threadpool is finished this function will also return.
+    /// Additionally it will return early if any job panics.
     ///
     /// Be careful though, returning early DOES NOT mean that the sent jobs are
     /// cancelled. They will remain running. Cancelling jobs that are queued is not
@@ -461,8 +457,6 @@ impl ThreadPool {
     /// This includes any errors since either the threadpool was created or since
     /// the state was reset.
     ///
-    /// This function will error if the function passed into it panics.
-    ///
     /// # Examples
     ///
     /// ```rust
@@ -473,30 +467,17 @@ impl ThreadPool {
     /// let builder = ThreadPoolBuilder::with_max_threads()?;
     /// let pool = builder.build()?;
     ///
-    /// for _ in 0..10 {
-    ///     pool.send_job(|| println!("Hello world"));
-    /// }
-    ///
-    /// assert!(pool.do_until_finished(|| println!("Hello world 2")).is_ok());
-    /// // Will print "Hello world" first, then a mix of "Hello world" and "Hello world 2"
+    /// assert!(pool.wait_until_job_done().is_ok());
     /// assert!(pool.is_finished());
-    ///
-    /// pool.send_job(|| println!("Hello world"));
-    ///
-    /// assert!(pool.do_until_finished(|| panic!("Test panic")).is_err());
-    /// // Will first print "Hello world" and then return with an error
-    /// assert!(!pool.has_paniced());
     ///
     /// pool.send_job(|| panic!("Test panic"));
     ///
-    /// assert!(pool.do_until_finished(|| println!("Printing after panic")).is_err());
-    /// // This will first panic from "Test panic", then it will print "Printing after panic"
-    /// // and only then will it return with an error
+    /// assert!(pool.wait_until_job_done().is_err());
     /// assert!(pool.has_paniced());
     /// # Ok(())
     /// # }
     /// ```
-    pub fn do_until_finished(&self, func: impl FnOnce() + UnwindSafe + Copy) -> Result<(), Errors> {
+    pub fn wait_until_job_done(&self) -> Result<(), JobHasPanicedError> {
         fn finished(guard: &MutexGuard<SharedState>) -> bool {
             guard.jobs_running == 0 && guard.jobs_queued == 0
         }
@@ -509,20 +490,21 @@ impl ThreadPool {
             .lock()
             .expect("Threadpool shared state has paniced");
 
-        while !finished(&guard) && !paniced(&guard) {
-            guard = self
-                .cvar
-                .wait(guard)
-                .expect("Threadpool shared state has paniced");
+        // This is guaranteed to work because jobs cannot finish without having
+        // the shared state lock, and we keep the lock until we start waiting for
+        // the condvar
+        if finished(&guard) {
+            return Ok(());
+        };
 
-            if catch_unwind(func).is_err() {
-                return Err(Errors::DoUntilFinishedFunctionPanicedError);
-            }
-        }
+        guard = self
+            .cvar
+            .wait(guard)
+            .expect("Threadpool shared state has paniced");
 
         // Keep the guard so we don't have to drop the lock only to reaquire it
         if paniced(&guard) {
-            Err(Errors::JobHasPanicedError)
+            Err(JobHasPanicedError {})
         } else {
             Ok(())
         }
@@ -578,14 +560,8 @@ impl ThreadPool {
         }
     }
 
-    /// This function will wait until all jobs have finished sending. Additionally
-    /// it will return early if any job panics and every time a job is completed
-    /// a function is executed.
-    ///
-    /// The function passed to execute on job completion may panic and this panic
-    /// will be caught. None of these panics will be caught. Panics from the threadpool
-    /// logged in it's state, however panics from the passed in function will not
-    /// be logged at all.
+    /// This function will wait until one job finished after calling the function.
+    /// Additionally, if the threadpool is finished this function will also return.
     ///
     /// Be careful though, returning early DOES NOT mean that the sent jobs are
     /// cancelled. They will remain running. Cancelling jobs that are queued is not
@@ -601,50 +577,39 @@ impl ThreadPool {
     /// let builder = ThreadPoolBuilder::with_max_threads()?;
     /// let pool = builder.build()?;
     ///
-    /// for _ in 0..10 {
-    ///     pool.send_job(|| println!("Hello world"));
-    /// }
-    ///
-    /// pool.do_until_finished_unchecked(|| println!("Hello world 2"));
-    /// // Will print "Hello world" first, then a mix of "Hello world" and "Hello world 2"
+    /// assert!(pool.wait_until_job_done().is_ok());
     /// assert!(pool.is_finished());
-    ///
-    /// pool.send_job(|| println!("Hello world"));
-    ///
-    /// pool.do_until_finished_unchecked(|| panic!("Test panic"));
-    /// // Will print "Hello world" first, then a mix of "Hello world" and "Hello world 2"
-    /// // NOTE: it will not catch the panics
-    ///
-    /// assert!(!pool.has_paniced());
     ///
     /// pool.send_job(|| panic!("Test panic"));
     ///
-    /// pool.do_until_finished_unchecked(|| println!("Printing after panic"));
-    /// // First panic with "Test panic", then a mix between print "Printing after panic"
-    /// // and "Test panic"
+    /// assert!(pool.wait_until_job_done().is_err());
     /// assert!(pool.has_paniced());
-    /// assert!(pool.is_finished());
     /// # Ok(())
     /// # }
     /// ```
-    pub fn do_until_finished_unchecked(&self, func: impl FnOnce() + UnwindSafe + Copy) {
+    pub fn wait_until_job_done_unchecked(&self) {
         fn finished(guard: &MutexGuard<SharedState>) -> bool {
             guard.jobs_running == 0 && guard.jobs_queued == 0
         }
 
-        let mut guard = self
+        let guard = self
             .shared_state
             .lock()
             .expect("Threadpool shared state has paniced");
 
-        while !finished(&guard) {
-            guard = self
-                .cvar
-                .wait(guard)
-                .expect("Threadpool shared state has paniced");
+        // This is guaranteed to work because jobs cannot finish without having
+        // the shared state lock, and we keep the lock until we start waiting for
+        // the condvar
+        if finished(&guard) {
+            return;
+        };
 
-            let _ = catch_unwind(func);
-        }
+        // Drop the guard once we get it, we don't want the lock
+        drop(
+            self.cvar
+                .wait(guard)
+                .expect("Threadpool shared state has paniced"),
+        );
     }
 
     /// This function will reset the state of this instance of the threadpool.
@@ -1439,15 +1404,17 @@ mod test {
     }
 
     #[test]
-    fn test_do_until_finished() {
+    fn test_wait_until_job_done() {
         const THREADS: usize = 1;
 
         let builder = ThreadPoolBuilder::with_thread_amount_usize(THREADS).unwrap();
         let pool = builder.build().unwrap();
 
+        assert!(pool.wait_until_job_done().is_ok());
+
         pool.send_job(|| {});
 
-        assert!(pool.do_until_finished(|| panic!("Test panic")).is_err());
+        assert!(pool.wait_until_job_done().is_ok());
 
         assert_eq!(pool.jobs_queued(), 0);
         assert_eq!(pool.jobs_running(), 0);
@@ -1455,7 +1422,7 @@ mod test {
 
         pool.send_job(|| panic!("Test panic"));
 
-        assert!(pool.do_until_finished(|| {}).is_err());
+        assert!(pool.wait_until_job_done().is_err());
 
         assert_eq!(pool.jobs_queued(), 0);
         assert_eq!(pool.jobs_running(), 0);
@@ -1463,15 +1430,18 @@ mod test {
     }
 
     #[test]
-    fn test_do_until_finished_unchecked() {
+    fn test_wait_until_job_done_unchecked() {
         const THREADS: usize = 1;
 
         let builder = ThreadPoolBuilder::with_thread_amount_usize(THREADS).unwrap();
         let pool = builder.build().unwrap();
 
+        // This doesn't block forever
+        pool.wait_until_job_done_unchecked();
+
         pool.send_job(|| {});
 
-        pool.do_until_finished_unchecked(|| panic!("Test panic"));
+        pool.wait_until_job_done_unchecked();
 
         assert_eq!(pool.jobs_queued(), 0);
         assert_eq!(pool.jobs_running(), 0);
@@ -1479,7 +1449,7 @@ mod test {
 
         pool.send_job(|| panic!("Test panic"));
 
-        pool.do_until_finished_unchecked(|| {});
+        pool.wait_until_job_done_unchecked();
 
         assert_eq!(pool.jobs_queued(), 0);
         assert_eq!(pool.jobs_running(), 0);
