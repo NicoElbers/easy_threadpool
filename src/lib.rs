@@ -1,4 +1,7 @@
 #![forbid(missing_docs)]
+// License at https://github.com/NicoElbers/easy_threadpool
+// It's MIT
+
 //! A simple thread pool to execute jobs in parallel
 //!
 //! A simple crate without dependencies which allows you to create a threadpool
@@ -12,20 +15,24 @@
 //! A basic use of the threadpool
 //!
 //! ```rust
+//! # use std::error::Error;
+//! # fn main() -> Result<(), Box<dyn Error>> {
 //! use easy_threadpool::ThreadPoolBuilder;
 //!
 //! fn job() {
 //!     println!("Hello world!");
 //! }
 //!
-//! let builder = ThreadPoolBuilder::with_max_threads().unwrap();
-//! let pool = builder.build().unwrap();
+//! let builder = ThreadPoolBuilder::with_max_threads()?;
+//! let pool = builder.build()?;
 //!
 //! for _ in 0..10 {
 //!     pool.send_job(job);
 //! }
 //!
 //! assert!(pool.wait_until_finished().is_ok());
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! ## More advanced usage
@@ -33,24 +40,28 @@
 //! A slightly more advanced usage of the threadpool
 //!
 //! ```rust
+//! # use std::error::Error;
+//! # fn main() -> Result<(), Box<dyn Error>> {
 //! use easy_threadpool::ThreadPoolBuilder;
 //! use std::sync::mpsc::channel;
 //!
-//! let builder = ThreadPoolBuilder::with_max_threads().unwrap();
-//! let pool = builder.build().unwrap();
+//! let builder = ThreadPoolBuilder::with_max_threads()?;
+//! let pool = builder.build()?;
 //!
 //! let (tx, rx) = channel();
 //!
 //! for _ in 0..10 {
 //!     let tx = tx.clone();
 //!     pool.send_job(move || {
-//!         tx.send(1).unwrap();
+//!         tx.send(1).expect("Receiver should still exist");
 //!     });
 //! }
 //!
 //! assert!(pool.wait_until_finished().is_ok());
 //!
 //! assert_eq!(rx.iter().take(10).fold(0, |a, b| a + b), 10);
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! ## Dealing with panics
@@ -58,6 +69,8 @@
 //! This threadpool implementation is resistant to jobs panicing
 //!
 //! ```rust
+//! # use std::error::Error;
+//! # fn main() -> Result<(), Box<dyn Error>> {
 //! use easy_threadpool::ThreadPoolBuilder;
 //! use std::sync::mpsc::channel;
 //! use std::num::NonZeroUsize;
@@ -66,15 +79,15 @@
 //!     panic!("Test panic");
 //! }
 //!
-//! let num = NonZeroUsize::try_from(1).unwrap();
+//! let num = NonZeroUsize::try_from(1)?;
 //! let builder = ThreadPoolBuilder::with_thread_amount(num);
-//! let pool = builder.build().unwrap();
+//! let pool = builder.build()?;
 //!
 //! let (tx, rx) = channel();
 //! for _ in 0..10 {
 //!     let tx = tx.clone();
 //!     pool.send_job(move || {
-//!         tx.send(1).unwrap();
+//!         tx.send(1).expect("Receiver should still exist");
 //!         panic!("Test panic");
 //!     });
 //! }
@@ -84,6 +97,8 @@
 //!
 //! assert_eq!(pool.jobs_paniced(), 10);
 //! assert_eq!(rx.iter().take(10).fold(0, |a, b| a + b), 10);
+//! # Ok(())
+//! # }
 //! ```
 
 use std::{
@@ -251,18 +266,22 @@ impl ThreadPool {
     ///
     /// Sending a function or closure to the threadpool
     /// ```rust
+    /// # use std::error::Error;
+    /// # fn main() -> Result<(), Box<dyn Error>> {
     /// use easy_threadpool::ThreadPoolBuilder;
     ///
     /// fn job() {
     ///     println!("Hello world from a function!");
     /// }
     ///
-    /// let builder = ThreadPoolBuilder::with_max_threads().unwrap();
-    /// let pool = builder.build().unwrap();
+    /// let builder = ThreadPoolBuilder::with_max_threads()?;
+    /// let pool = builder.build()?;
     ///
     /// pool.send_job(job);
     ///
     /// pool.send_job(|| println!("Hello world from a closure!"));
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn send_job(&self, job: impl FnOnce() + Send + UnwindSafe + 'static) {
         // NOTE: It is essential that the shared state is updated FIRST otherwise
@@ -341,10 +360,12 @@ impl ThreadPool {
     /// # Examples
     ///
     /// ```rust
+    /// # use std::error::Error;
+    /// # fn main() -> Result<(), Box<dyn Error>> {
     /// use easy_threadpool::ThreadPoolBuilder;
     ///
-    /// let builder = ThreadPoolBuilder::with_max_threads().unwrap();
-    /// let pool = builder.build().unwrap();
+    /// let builder = ThreadPoolBuilder::with_max_threads()?;
+    /// let pool = builder.build()?;
     ///
     /// for _ in 0..10 {
     ///     pool.send_job(|| println!("Hello world"));
@@ -357,6 +378,8 @@ impl ThreadPool {
     ///
     /// assert!(pool.wait_until_finished().is_err());
     /// assert!(pool.has_paniced());
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn wait_until_finished(&self) -> Result<(), JobHasPanicedError> {
         fn finished(guard: &MutexGuard<SharedState>) -> bool {
@@ -396,10 +419,12 @@ impl ThreadPool {
     /// # Examples
     ///
     /// ```rust
+    /// # use std::error::Error;
+    /// # fn main() -> Result<(), Box<dyn Error>> {
     /// use easy_threadpool::ThreadPoolBuilder;
     ///
-    /// let builder = ThreadPoolBuilder::with_max_threads().unwrap();
-    /// let pool = builder.build().unwrap();
+    /// let builder = ThreadPoolBuilder::with_max_threads()?;
+    /// let pool = builder.build()?;
     ///
     /// for _ in 0..10 {
     ///     pool.send_job(|| println!("Hello world"));
@@ -412,6 +437,8 @@ impl ThreadPool {
     ///
     /// pool.wait_until_finished_unchecked();
     /// assert!(pool.has_paniced());
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn wait_until_finished_unchecked(&self) {
         fn finished(guard: &MutexGuard<SharedState>) -> bool {
@@ -442,10 +469,12 @@ impl ThreadPool {
     /// # Examples
     ///
     /// ```rust
+    /// # use std::error::Error;
+    /// # fn main() -> Result<(), Box<dyn Error>> {
     /// use easy_threadpool::ThreadPoolBuilder;
     ///
-    /// let builder = ThreadPoolBuilder::with_max_threads().unwrap();
-    /// let mut pool = builder.build().unwrap();
+    /// let builder = ThreadPoolBuilder::with_max_threads()?;
+    /// let mut pool = builder.build()?;
     ///
     /// pool.send_job(|| panic!("Test panic"));
     ///
@@ -456,6 +485,8 @@ impl ThreadPool {
     ///
     /// assert!(pool.wait_until_finished().is_ok());
     /// assert!(!pool.has_paniced());
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn reset_state(&mut self) {
         let cvar = Arc::new(Condvar::new());
@@ -476,10 +507,12 @@ impl ThreadPool {
     /// # Examples
     ///
     /// ```rust
+    /// # use std::error::Error;
+    /// # fn main() -> Result<(), Box<dyn Error>> {
     /// use easy_threadpool::ThreadPoolBuilder;
     ///
-    /// let builder = ThreadPoolBuilder::with_max_threads().unwrap();
-    /// let pool = builder.build().unwrap();
+    /// let builder = ThreadPoolBuilder::with_max_threads()?;
+    /// let pool = builder.build()?;
     ///
     /// let pool_clone = pool.clone_with_new_state();
     ///
@@ -490,6 +523,8 @@ impl ThreadPool {
     ///
     /// assert!(pool_clone.wait_until_finished().is_ok());
     /// assert!(!pool_clone.has_paniced());
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn clone_with_new_state(&self) -> Self {
         let mut new_pool = self.clone();
@@ -505,6 +540,8 @@ impl ThreadPool {
     /// # Examples
     ///
     /// ```rust
+    /// # use std::error::Error;
+    /// # fn main() -> Result<(), Box<dyn Error>> {
     /// use easy_threadpool::ThreadPoolBuilder;
     /// use std::{
     ///     num::NonZeroUsize,
@@ -513,8 +550,8 @@ impl ThreadPool {
     /// let threads = 16;
     /// let tasks = threads * 10;
     ///
-    /// let num = NonZeroUsize::try_from(threads).unwrap();
-    /// let pool = ThreadPoolBuilder::with_thread_amount(num).build().unwrap();
+    /// let num = NonZeroUsize::try_from(threads)?;
+    /// let pool = ThreadPoolBuilder::with_thread_amount(num).build()?;
     ///
     /// let b0 = Arc::new(Barrier::new(threads + 1));
     /// let b1 = Arc::new(Barrier::new(threads + 1));
@@ -533,7 +570,9 @@ impl ThreadPool {
     ///
     /// b0.wait();
     /// assert_eq!(pool.jobs_running(), threads);
-    /// b1.wait();
+    /// # b1.wait();
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn jobs_running(&self) -> usize {
         self.shared_state
@@ -549,6 +588,8 @@ impl ThreadPool {
     /// # Examples
     ///
     /// ```rust
+    /// # use std::error::Error;
+    /// # fn main() -> Result<(), Box<dyn Error>> {
     /// use easy_threadpool::ThreadPoolBuilder;
     /// use std::{
     ///     num::NonZeroUsize,
@@ -557,8 +598,8 @@ impl ThreadPool {
     /// let threads = 16;
     /// let tasks = 100;
     ///
-    /// let num = NonZeroUsize::try_from(threads).unwrap();
-    /// let pool = ThreadPoolBuilder::with_thread_amount(num).build().unwrap();
+    /// let num = NonZeroUsize::try_from(threads)?;
+    /// let pool = ThreadPoolBuilder::with_thread_amount(num).build()?;
     ///
     /// let b0 = Arc::new(Barrier::new(threads + 1));
     /// let b1 = Arc::new(Barrier::new(threads + 1));
@@ -577,7 +618,9 @@ impl ThreadPool {
     ///
     /// b0.wait();
     /// assert_eq!(pool.jobs_queued(), tasks - threads);
-    /// b1.wait();
+    /// # b1.wait();
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn jobs_queued(&self) -> usize {
         self.shared_state
@@ -592,9 +635,11 @@ impl ThreadPool {
     /// # Examples
     ///
     /// ```rust
+    /// # use std::error::Error;
+    /// # fn main() -> Result<(), Box<dyn Error>> {
     /// use easy_threadpool::ThreadPoolBuilder;
     ///
-    /// let pool = ThreadPoolBuilder::with_max_threads().unwrap().build().unwrap();
+    /// let pool = ThreadPoolBuilder::with_max_threads()?.build()?;
     ///
     /// for i in 0..10 {
     ///     pool.send_job(|| panic!("Test panic"));
@@ -603,6 +648,8 @@ impl ThreadPool {
     /// pool.wait_until_finished_unchecked();
     ///
     /// assert_eq!(pool.jobs_paniced(), 10);
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn jobs_paniced(&self) -> usize {
         self.shared_state
@@ -616,15 +663,19 @@ impl ThreadPool {
     /// # Examples
     ///
     /// ```rust
+    /// # use std::error::Error;
+    /// # fn main() -> Result<(), Box<dyn Error>> {
     /// use easy_threadpool::ThreadPoolBuilder;
     ///
-    /// let pool = ThreadPoolBuilder::with_max_threads().unwrap().build().unwrap();
+    /// let pool = ThreadPoolBuilder::with_max_threads()?.build()?;
     ///
     /// pool.send_job(|| panic!("Test panic"));
     ///
     /// pool.wait_until_finished_unchecked();
     ///
     /// assert!(pool.has_paniced());
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn has_paniced(&self) -> bool {
         self.jobs_paniced() != 0
@@ -636,12 +687,14 @@ impl ThreadPool {
     /// # Examples
     ///
     /// ```rust
+    /// # use std::error::Error;
+    /// # fn main() -> Result<(), Box<dyn Error>> {
     /// use easy_threadpool::ThreadPoolBuilder;
     /// use std::{
     ///     num::NonZeroUsize,
     ///     sync::{Arc, Barrier},
     /// };
-    /// let pool = ThreadPoolBuilder::with_max_threads().unwrap().build().unwrap();
+    /// let pool = ThreadPoolBuilder::with_max_threads()?.build()?;
     ///
     /// let b = Arc::new(Barrier::new(2));
     ///
@@ -651,8 +704,9 @@ impl ThreadPool {
     /// pool.send_job(move || { b_clone.wait(); });
     ///
     /// assert!(!pool.is_finished());
-    ///
-    /// b.wait();
+    /// # b.wait();
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn is_finished(&self) -> bool {
         self.jobs_running() == 0 && self.jobs_queued() == 0
@@ -663,15 +717,19 @@ impl ThreadPool {
     /// # Examples
     ///
     /// ```rust
+    /// # use std::error::Error;
+    /// # fn main() -> Result<(), Box<dyn Error>> {
     /// use easy_threadpool::ThreadPoolBuilder;
     /// use std::num::NonZeroUsize;
     ///
     /// let threads = 10;
     ///
-    /// let num = NonZeroUsize::try_from(threads).unwrap();
-    /// let pool = ThreadPoolBuilder::with_thread_amount(num).build().unwrap();
+    /// let num = NonZeroUsize::try_from(threads)?;
+    /// let pool = ThreadPoolBuilder::with_thread_amount(num).build()?;
     ///
     /// assert_eq!(pool.threads().get(), threads);
+    /// # Ok(())
+    /// # }
     /// ```
     pub const fn threads(&self) -> NonZeroUsize {
         self.thread_amount
