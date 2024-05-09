@@ -249,6 +249,7 @@ impl SharedState {
 }
 
 /// Threadpool abstraction to keep some state
+#[derive(Debug)]
 pub struct ThreadPool {
     thread_amount: NonZeroUsize,
     job_sender: Arc<Sender<ThreadPoolFunctionBoxed>>,
