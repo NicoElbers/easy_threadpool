@@ -26,7 +26,7 @@ Add this to the `Cargo.toml` to use the crate:
 
 ```toml
 [dependencies]
-easy-threadpool = "0.3.0"
+easy-threadpool = "0.3.1"
 ```
 
 Afterwards use the library like this:
@@ -58,8 +58,6 @@ For more examples, look at the documentation in the source [here](https://github
 ## MSRV
 
 This crate currently works with rust version 1.72.0 or later. But this is in no way guaranteed as development continues.
-
-NOTE: I think this changed in 0.3.0, will confirm sometime soon
 
 ## Similar libraries
 
