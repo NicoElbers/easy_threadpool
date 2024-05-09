@@ -108,10 +108,11 @@ use std::{
     num::{NonZeroUsize, TryFromIntError},
     panic::{catch_unwind, UnwindSafe},
     sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{channel, Sender},
-        Arc, Condvar, Mutex, MutexGuard,
+        Arc, Condvar, Mutex,
     },
-    thread::{self, available_parallelism, current},
+    thread::{self, available_parallelism},
 };
 
 type ThreadPoolFunctionBoxed = Box<dyn FnOnce() + Send + UnwindSafe>;
@@ -162,50 +163,88 @@ impl Error for JobHasPanicedError {}
 
 // impl Error for Errors {}
 
+#[derive(Debug, Default)]
 struct SharedState {
-    jobs_queued: usize,
-    jobs_running: usize,
-    jobs_paniced: usize,
+    jobs_queued: AtomicUsize,
+    jobs_running: AtomicUsize,
+    jobs_paniced: AtomicUsize,
+    is_finished: Mutex<bool>,
+    has_paniced: AtomicBool,
 }
 
 impl Display for SharedState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "SharedState<jobs_queued: {}, jobs_running: {}, jobs_paniced: {}>",
-            self.jobs_queued, self.jobs_running, self.jobs_paniced
+            "SharedState<jobs_queued: {}, jobs_running: {}, jobs_paniced: {}, is_finished: {}, has_paniced: {}>",
+            self.jobs_queued.load(Ordering::Relaxed),
+            self.jobs_running.load(Ordering::Relaxed),
+            self.jobs_paniced.load(Ordering::Relaxed),
+            self.is_finished.lock().expect("Shared state should never panic"),
+            self.has_paniced.load(Ordering::Relaxed)
         )
     }
 }
 
 impl SharedState {
-    fn new() -> Arc<Mutex<Self>> {
-        Arc::new(Mutex::new(Self {
-            jobs_running: 0,
-            jobs_queued: 0,
-            jobs_paniced: 0,
-        }))
+    fn new() -> Self {
+        Self {
+            jobs_running: AtomicUsize::new(0),
+            jobs_queued: AtomicUsize::new(0),
+            jobs_paniced: AtomicUsize::new(0),
+            is_finished: Mutex::new(true),
+            has_paniced: AtomicBool::new(false),
+        }
     }
 
-    fn job_starting(&mut self) {
-        debug_assert!(self.jobs_queued > 0, "Negative jobs queued");
+    fn job_starting(&self) {
+        debug_assert!(
+            self.jobs_queued.load(Ordering::Acquire) > 0,
+            "Negative jobs queued"
+        );
 
-        self.jobs_queued -= 1;
-        self.jobs_running += 1;
+        self.jobs_running.fetch_add(1, Ordering::SeqCst);
+        self.jobs_queued.fetch_sub(1, Ordering::SeqCst);
     }
 
-    fn job_finished(&mut self) {
-        debug_assert!(self.jobs_running > 0, "Negative jobs running");
+    fn job_finished(&self) {
+        debug_assert!(
+            self.jobs_running.load(Ordering::Acquire) > 0,
+            "Negative jobs running"
+        );
 
-        self.jobs_running -= 1;
+        self.jobs_running.fetch_sub(1, Ordering::SeqCst);
+
+        if self.jobs_queued.load(Ordering::Acquire) == 0
+            && self.jobs_running.load(Ordering::Acquire) == 0
+        {
+            let mut is_finished = self
+                .is_finished
+                .lock()
+                .expect("Shared state should never panic");
+
+            *is_finished = true;
+        }
     }
 
-    fn job_queued(&mut self) {
-        self.jobs_queued += 1;
+    fn job_queued(&self) {
+        self.jobs_queued.fetch_add(1, Ordering::SeqCst);
+
+        let mut is_finished = self
+            .is_finished
+            .lock()
+            .expect("Shared state should never panic");
+
+        *is_finished = false;
     }
 
-    fn job_paniced(&mut self) {
-        self.jobs_paniced += 1;
+    fn job_paniced(&self) {
+        println!("Checking panic");
+
+        self.has_paniced.store(true, Ordering::SeqCst);
+        self.jobs_paniced.fetch_add(1, Ordering::SeqCst);
+
+        println!("Has paniced {}", self.has_paniced.load(Ordering::Acquire));
     }
 }
 
@@ -213,7 +252,7 @@ impl SharedState {
 pub struct ThreadPool {
     thread_amount: NonZeroUsize,
     job_sender: Arc<Sender<ThreadPoolFunctionBoxed>>,
-    shared_state: Arc<Mutex<SharedState>>,
+    shared_state: Arc<SharedState>,
     cvar: Arc<Condvar>,
 }
 
@@ -230,15 +269,10 @@ impl Clone for ThreadPool {
 
 impl Display for ThreadPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let state = self
-            .shared_state
-            .lock()
-            .expect("Threadpool shared state has paniced");
-
         write!(
             f,
             "Threadpool< thread_amount: {}, shared_state: {}>",
-            self.thread_amount, state
+            self.thread_amount, self.shared_state
         )
     }
 }
@@ -251,7 +285,7 @@ impl ThreadPool {
         let job_sender = Arc::new(job_sender);
         let shareable_job_reciever = Arc::new(Mutex::new(job_receiver));
 
-        let shared_state = SharedState::new();
+        let shared_state = Arc::new(SharedState::new());
         let cvar = Arc::new(Condvar::new());
 
         for thread_num in 0..thread_amount.get() {
@@ -321,10 +355,10 @@ impl ThreadPool {
         // NOTE: It is essential that the shared state is updated FIRST otherwise
         // we have a race condidition that the job is transmitted and read before
         // the shared state is updated, leading to a negative amount of jobs queued
-        self.shared_state
-            .lock()
-            .expect("Threadpool shared state has paniced")
-            .job_queued();
+        self.shared_state.job_queued();
+
+        debug_assert!(self.jobs_queued() > 0, "Job didn't queue properly");
+        debug_assert!(!self.is_finished(), "Finish wasn't properly set to false");
 
         // Pass our own state to the job. This makes it so that multiple threadpools
         // with different states can send jobs to the same threads without getting
@@ -340,39 +374,27 @@ impl ThreadPool {
 
     fn job_function(
         job: ThreadPoolFunctionBoxed,
-        state: Arc<Mutex<SharedState>>,
+        state: Arc<SharedState>,
         cvar: Arc<Condvar>,
     ) -> impl FnOnce() + Send + 'static {
         move || {
-            state
-                .lock()
-                .expect("Threadpool shared state has paniced")
-                .job_starting();
+            state.job_starting();
 
             // NOTE: The use of catch_unwind means that the thread will not
             // panic from any of the jobs it was sent. This is useful because
             // we won't ever have to restart a thread.
             let result = catch_unwind(job);
 
+            println!("{result:?}");
+
             // NOTE: Do the panic check first otherwise we have a race condition
             // where the final job panics and the wait_until_finished function
             // doesn't detect it
             if result.is_err() {
-                state
-                    .lock()
-                    .expect("Threadpool shared state has paniced")
-                    .job_paniced();
-
-                eprintln!(
-                    "Job paniced: Thread \"{}\" is panicing",
-                    current().name().unwrap_or("Unnamed worker")
-                );
+                state.job_paniced();
             }
 
-            state
-                .lock()
-                .expect("Threadpool shared state has paniced")
-                .job_finished();
+            state.job_finished();
 
             cvar.notify_all();
         }
@@ -416,30 +438,39 @@ impl ThreadPool {
     /// # }
     /// ```
     pub fn wait_until_finished(&self) -> Result<(), JobHasPanicedError> {
-        fn finished(guard: &MutexGuard<SharedState>) -> bool {
-            guard.jobs_running == 0 && guard.jobs_queued == 0
-        }
-        fn paniced(guard: &MutexGuard<SharedState>) -> bool {
-            guard.jobs_paniced != 0
-        }
-
-        let mut guard = self
+        let mut is_finished = self
             .shared_state
+            .is_finished
             .lock()
-            .expect("Threadpool shared state has paniced");
+            .expect("Shared state should never panic");
 
-        while !finished(&guard) && !paniced(&guard) {
-            guard = self
+        while !*is_finished && !self.has_paniced() {
+            is_finished = self
                 .cvar
-                .wait(guard)
-                .expect("Threadpool shared state has paniced");
+                .wait(is_finished)
+                .expect("Shared state should never panic");
         }
 
-        // Keep the guard so we don't have to drop the lock only to reaquire it
-        if paniced(&guard) {
-            Err(JobHasPanicedError {})
-        } else {
-            Ok(())
+        println!("panic {}", self.has_paniced());
+
+        debug_assert!(
+            self.has_paniced() || self.jobs_running() == 0,
+            "wait_until_finished stopped {} jobs running and {} panics",
+            self.jobs_running(),
+            self.jobs_paniced()
+        );
+        debug_assert!(
+            self.has_paniced() || self.jobs_queued() == 0,
+            "wait_until_finished stopped while {} jobs queued and {} panics",
+            self.jobs_queued(),
+            self.jobs_paniced()
+        );
+
+        println!("WERE DONE WAITING");
+
+        match self.shared_state.has_paniced.load(Ordering::Acquire) {
+            true => Err(JobHasPanicedError {}),
+            false => Ok(()),
         }
     }
 
@@ -478,32 +509,24 @@ impl ThreadPool {
     /// # }
     /// ```
     pub fn wait_until_job_done(&self) -> Result<(), JobHasPanicedError> {
-        fn finished(guard: &MutexGuard<SharedState>) -> bool {
-            guard.jobs_running == 0 && guard.jobs_queued == 0
-        }
-        fn paniced(guard: &MutexGuard<SharedState>) -> bool {
-            guard.jobs_paniced != 0
+        fn paniced(state: &SharedState) -> bool {
+            state.jobs_paniced.load(Ordering::Acquire) != 0
         }
 
-        let mut guard = self
+        let is_finished = self
             .shared_state
+            .is_finished
             .lock()
-            .expect("Threadpool shared state has paniced");
+            .expect("Shared state should never panic");
 
-        // This is guaranteed to work because jobs cannot finish without having
-        // the shared state lock, and we keep the lock until we start waiting for
-        // the condvar
-        if finished(&guard) {
+        if *is_finished {
             return Ok(());
         };
 
-        guard = self
-            .cvar
-            .wait(guard)
-            .expect("Threadpool shared state has paniced");
+        drop(self.cvar.wait(is_finished));
 
         // Keep the guard so we don't have to drop the lock only to reaquire it
-        if paniced(&guard) {
+        if paniced(&self.shared_state) {
             Err(JobHasPanicedError {})
         } else {
             Ok(())
@@ -542,22 +565,31 @@ impl ThreadPool {
     /// # }
     /// ```
     pub fn wait_until_finished_unchecked(&self) {
-        fn finished(guard: &MutexGuard<SharedState>) -> bool {
-            guard.jobs_running == 0 && guard.jobs_queued == 0
-        }
-
-        let mut guard = self
+        let mut is_finished = self
             .shared_state
+            .is_finished
             .lock()
-            .expect("Threadpool shared state has paniced");
+            .expect("Shared state sould never panic");
 
-        // Keep the guard so we don't have to drop the lock only to reaquire it
-        while !finished(&guard) {
-            guard = self
-                .cvar
-                .wait(guard)
-                .expect("Threadpool shared state has paniced");
+        if *is_finished {
+            return;
         }
+
+        while !*is_finished {
+            is_finished = self
+                .cvar
+                .wait(is_finished)
+                .expect("Shared state should never panic")
+        }
+
+        debug_assert!(
+            self.shared_state.jobs_running.load(Ordering::Acquire) == 0,
+            "Job still running after wait_until_finished_unchecked"
+        );
+        debug_assert!(
+            self.shared_state.jobs_queued.load(Ordering::Acquire) == 0,
+            "Job still queued after wait_until_finished_unchecked"
+        );
     }
 
     /// This function will wait until one job finished after calling the function.
@@ -588,28 +620,20 @@ impl ThreadPool {
     /// # }
     /// ```
     pub fn wait_until_job_done_unchecked(&self) {
-        fn finished(guard: &MutexGuard<SharedState>) -> bool {
-            guard.jobs_running == 0 && guard.jobs_queued == 0
-        }
-
-        let guard = self
+        let is_finished = self
             .shared_state
+            .is_finished
             .lock()
-            .expect("Threadpool shared state has paniced");
+            .expect("Shared state should never panic");
 
         // This is guaranteed to work because jobs cannot finish without having
         // the shared state lock, and we keep the lock until we start waiting for
         // the condvar
-        if finished(&guard) {
+        if *is_finished {
             return;
         };
 
-        // Drop the guard once we get it, we don't want the lock
-        drop(
-            self.cvar
-                .wait(guard)
-                .expect("Threadpool shared state has paniced"),
-        );
+        drop(self.cvar.wait(is_finished));
     }
 
     /// This function will reset the state of this instance of the threadpool.
@@ -643,7 +667,7 @@ impl ThreadPool {
     /// ```
     pub fn reset_state(&mut self) {
         let cvar = Arc::new(Condvar::new());
-        let shared_state = SharedState::new();
+        let shared_state = Arc::new(SharedState::new());
 
         self.cvar = cvar;
         self.shared_state = shared_state;
@@ -728,10 +752,7 @@ impl ThreadPool {
     /// # }
     /// ```
     pub fn jobs_running(&self) -> usize {
-        self.shared_state
-            .lock()
-            .expect("Threadpool shared state has paniced")
-            .jobs_running
+        self.shared_state.jobs_running.load(Ordering::Acquire)
     }
 
     /// Returns the amount of jobs currently queued by this threadpool instance.
@@ -776,10 +797,7 @@ impl ThreadPool {
     /// # }
     /// ```
     pub fn jobs_queued(&self) -> usize {
-        self.shared_state
-            .lock()
-            .expect("Threadpool shared state has paniced")
-            .jobs_queued
+        self.shared_state.jobs_queued.load(Ordering::Acquire)
     }
 
     /// Returns the amount of jobs that were sent by this instance of the threadpool
@@ -805,10 +823,7 @@ impl ThreadPool {
     /// # }
     /// ```
     pub fn jobs_paniced(&self) -> usize {
-        self.shared_state
-            .lock()
-            .expect("Threadpool shared state has paniced")
-            .jobs_paniced
+        self.shared_state.jobs_paniced.load(Ordering::Acquire)
     }
 
     /// Returns whether a thread has had any jobs panic at all
@@ -831,7 +846,7 @@ impl ThreadPool {
     /// # }
     /// ```
     pub fn has_paniced(&self) -> bool {
-        self.jobs_paniced() != 0
+        self.shared_state.has_paniced.load(Ordering::Acquire)
     }
 
     /// Returns whether a threadpool instance has no jobs running and no jobs queued,
@@ -862,7 +877,11 @@ impl ThreadPool {
     /// # }
     /// ```
     pub fn is_finished(&self) -> bool {
-        self.jobs_running() == 0 && self.jobs_queued() == 0
+        *self
+            .shared_state
+            .is_finished
+            .lock()
+            .expect("Shared state should never panic")
     }
 
     /// This function returns the amount of threads used to create the threadpool
@@ -1456,7 +1475,7 @@ mod test {
         assert_eq!(pool.jobs_paniced(), 1);
     }
 
-    // #[test]
+    #[test]
     #[allow(dead_code)]
     fn test_flakiness() {
         for _ in 0..10 {
@@ -1466,6 +1485,9 @@ mod test {
             receive_value();
             test_clones();
             reset_state_while_running();
+            test_wait_until_job_done_unchecked();
+            test_wait_until_job_done();
+            reset_panic_test();
         }
     }
 }
